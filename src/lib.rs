@@ -1,4 +1,3 @@
-
 extern crate futures;
 
 // BJORN KOLBECK, MIKAEL HOGQVIST, JAN STENDER, FELIX HUPFELD
@@ -19,12 +18,13 @@ pub mod rbr {
 	}
 
     // ReadValue is the return value of the read operation.
-	pub struct ReadValue<K, V> {
+    #[derive(Debug, Copy, Clone)]
+	pub struct ReadValue<'a, K: 'a, V: 'a> {
 		pub written_at: K,
-		pub val: Option<V>,
+		pub val: Option<&'a V>,
 	}
 
-	impl <K: Ord + Copy, V: Copy> Register<K, V> {
+	impl <'a, K: Ord + Copy, V> Register<K, V> {
 
 		// empty initialize an empty register with k read and write K.
 		pub fn empty(k: K) -> Register<K, V> {
@@ -45,7 +45,11 @@ pub mod rbr {
 				None
 			} else {
 				self.read_at = k;
-				Some(ReadValue{written_at: self.written_at, val: self.val})
+                let val = match self.val {
+                    Some(ref v) => Some(v),
+                    None => None,
+                };
+				Some(ReadValue{written_at: self.written_at, val: val})
 			}
 		}
 
@@ -57,12 +61,12 @@ pub mod rbr {
         // Lemma R3. Read-write-commit: If read(k) or write(k,*) commits, then
         // no subsequent read(k') can commit with k' <= k or write(k'',*) can
         // commit with k'' <= k.
-		pub fn write(&mut self, k: K, val: V) -> Option<()> {
+		pub fn write(&mut self, k: K, v: V) -> Option<()> {
 			if self.written_at > k || self.read_at > k {
 				None
 			} else {
 				self.written_at = k;
-				self.val = Some(val);
+				self.val = Some(v);
 				Some(())
 			}
 		}
@@ -78,119 +82,80 @@ pub mod rbr {
             Error(io::Error),
         }
 
-        pub trait RPC<'a, K, V> {
-            fn read(&'a self, K) -> Result<ReadValue<K, V>, Failure>;
-            fn write(&'a self, K, V) -> Result<(), Failure>;
+        pub trait RPC<K, V> {
+            fn read<'a>(&self, K) -> Result<ReadValue<'a, K, V>, Failure>;
+            // fn write(&self, K, &V) -> Result<(), Failure>;
         }
 
-        pub trait Node<'a, K, V>: RPC<'a, K, V> {
+        pub trait Node<K, V>: RPC<K, V> {
             fn id(&self) -> u32;
         }
 
-        pub mod threaded {
+        pub struct Cluster<'a, K: 'a, V: 'a> {
+            nodes: [&'a Node<K, V>],
+        }
 
-            use super::{Failure, RPC, Node};
-            use rbr::{ReadValue};
+        impl<'a, K: Ord + Copy, V: Clone> RPC<K, V> for Cluster<'a, K, V> {
 
-            pub struct Cluster<'a, K, V> {
-                nodes: [&'a Node<'a, K, V>],
-            }
+            fn read<'b>(&self, k: K) -> Result<ReadValue<'b, K, V>, Failure> {
 
-            struct ReadProgress<K, V> {
-                quorum: i32, // remaining reads needed to reach quorum
-                errors: i32, // remaining errors
-                rval: Option<ReadValue<K, V>>, // read value
-                failure: Option<Failure>, // last seen error
-            }
+                let len: i32 = self.nodes.len() as i32;
+                let mut quorum =  1 + len / 2;
+                let mut errors =  len - quorum + 1;
+                let mut rval : Option<ReadValue<K, V>> = None;
+                let mut error : Failure = Failure::Abort;
 
-            impl<K: Ord + Copy, V: Copy> ReadProgress<K, V> {
-                fn set(&mut self, result: Result<ReadValue<K, V>, Failure>) {
-                    match result {
-                        Ok(rval) => {
-                            self.quorum -= 1;
-                            match self.rval {
-                                Some(original_rval) => {
-                                    if original_rval.written_at < rval.written_at {
-                                        self.rval = Some(rval);
+                for node in self.nodes.iter() {
+                    let nval : Result<Option<ReadValue<K, V>>, Failure> = {
+                        match node.read(k) {
+                            Ok(node_rval) => {
+                                match rval {
+                                    Some(ref rv) => {
+                                        if rv.written_at < node_rval.written_at {
+                                           Ok(Some(node_rval))
+                                        } else {
+                                           Ok(None)
+                                        }
+                                    },
+                                    None => {
+                                        Ok(Some(node_rval))
                                     }
-                                },
-                                None => self.rval = Some(rval),
-                            }
-                        },
-                        Err(failure) => {
-                            match failure {
-                                Failure::Abort => {
-                                    self.errors = 0;
-                                    self.failure = Some(Failure::Abort);
-                                },
-                                Failure::Error(err) => {
-                                    self.errors -= 1;
-                                    self.failure = Some(Failure::Error(err));
                                 }
-                            }
-                        },
-                    }
-                }
-            }
+                            },
+                            Err(e) => Err(e),
+                        }
+                    };
 
-            struct WriteProgress {
-                quorum: i32,
-                errors: i32,
-                failure: Option<Failure>,
-            }
-
-            impl WriteProgress {
-                fn set(&mut self, result: Result<(), Failure>) {
-                    match result {
-                        Ok(rval) => {
-                            self.quorum -= 1;
-                        },
-                        Err(failure) => {
-                            match failure {
-                                Failure::Abort => {
-                                    self.errors = 0;
-                                    self.failure = Some(Failure::Abort);
+                    match nval {
+                        Ok(ov) => {
+                            quorum -= 1;
+                            match ov {
+                                Some(rv) => {
+                                    rval = Some(rv)
                                 },
-                                Failure::Error(err) => {
-                                    self.errors -= 1;
-                                    self.failure = Some(Failure::Error(err));
-                                }
+                                None => {},
                             }
                         },
+                        Err(Failure::Abort) => return Err(Failure::Abort),
+                        Err(e) => {
+                            errors -= 1;
+                            error = e;
+                        },
                     }
-                }
-            }
 
-            impl<'a, K: Ord + Copy, V: Copy> RPC<
-            'a, K, V> for Cluster<'a, K, V> {
-
-                fn read(&self, k: K) -> Result<ReadValue<K, V>, Failure> {
-
-                    let len = self.nodes.len();
-                    let quorum =  1 + len / 2;
-                    let errors =  len - quorum + 1;
-
-                    let progress = self.nodes.iter()
-                        .map(|node| node.read(k))
-                        .fold(ReadProgress{ quorum, errors, None, None }, |progress, result| {
-                            progress.set(result);
-                            progress;
-                        })
-                        .take_while(|progress, _result| progress.errors > 0 || progress.quorum > 0)
-                        .last(|p, _| p);
-
-                    if progress.quorum <= 0 {
-                        Ok(progress.rval.unwrap())
-                    } else {
-                        Err(progress.failure.unwrap())
+                    if errors <= 0 || quorum <= 0 {
+                        break
                     }
                 }
 
-                fn write(&self, k: K, v: V) -> Result<(), Failure> {
+                if quorum <= 0 {
+                    match rval {
+                        Some(v) => return Ok(v),
+                        None => return Err(error),
+                    }
                 }
+                return Err(error)
             }
-
-
         }
     }
 
@@ -198,16 +163,19 @@ pub mod rbr {
 
 #[cfg(test)]
 mod tests {
-	use std::time::{Instant, Duration};
-	use rbr::{Register};
+    use std::time::{Instant, Duration};
+    use std::result::{Result};
+    use std::cell::{RefCell};
+
+    use rbr::*;
+    use rbr::distributed::*;
 
     #[test]
     fn register_read_write_value() {
     	let now = Instant::now();
         let mut reg : Register<Instant, i32> = Register::empty(now);
-        let read = reg.read(now);
- 
-		assert!(read.is_none(), "read with same k the register was created must fail");
+
+        assert!(reg.read(now).is_none(), "read with same k the register was created must fail");
 
         // This can be suprising at first. But this is straightforward once you
         // consider this is a distributed register. If no other process
@@ -217,20 +185,46 @@ mod tests {
         assert_eq!(reg.write(now, 3).is_none(), false, "write with the same k must succeed");
 
         let later = now + Duration::from_millis(1);
-        let read = reg.read(later);
-        assert_eq!(read.is_none(), false, "read must succeed with a later timestamp");
-        let rval = read.unwrap();
+        {
+            let read = reg.read(later);
+            assert_eq!(read.is_none(), false, "read must succeed with a later timestamp");
+            let rval = read.unwrap();
 
-        assert_eq!(rval.written_at, now);
-        assert_eq!(rval.val.unwrap(), 3);
+            assert_eq!(rval.written_at, now);
+            assert_eq!(*rval.val.unwrap(), 3);
+        }
 
-        let read = reg.read(later);
-        assert!(read.is_none(), "read with same read k must fail");
-
-        let read = reg.read(now);
-        assert!(read.is_none(), "read with an older k must fail");
+        assert!(reg.read(later).is_none(), "read with same read k must fail");
+        assert!(reg.read(now).is_none(), "read with an older k must fail");
 
         assert_eq!(reg.write(now, 10).is_none(), true, "write with a later k must fail");
         assert_eq!(reg.write(later, 1).is_none(), false, "write with a later k must fail");
     }
+
+    struct TestOKNode<'a, K: 'a, V: 'a> {
+        id:  u32,
+        reg: RefCell<'a, Register<K, V>>,
+    }
+
+    impl<'a, K: Ord + Copy, V: Clone> Node<K, V> for TestOKNode<K, V> {
+
+        fn id(&self) -> u32 {
+            self.id
+        }
+
+    }
+
+    impl<'a, K: Ord + Copy, V: Clone> RPC<K, V> for TestOKNode<K, V> {
+
+        fn read<'b>(&self, k: K) -> Result<ReadValue<'b, K, V>, Failure> {
+            match self.reg.borrow_mut().read(k) {
+                Some(rval) => {
+                    Ok(rval.clone())
+                },
+                None => Err(Failure::Abort),
+            }
+        }
+
+    }
+
 }
