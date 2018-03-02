@@ -59,6 +59,8 @@ pub mod rbr {
         // no subsequent read(k') can commit with k' <= k or write(k'',*) can
         // commit with k'' <= k.
 		pub fn write(&mut self, k: K, v: V) -> Option<()> {
+            // TODO(gwik): consider taking &V and clone on success only.
+
 			if self.written_at > k || self.read_at > k {
 				None
 			} else {
@@ -75,6 +77,7 @@ pub mod rbr {
         use std::result::{Result};
         use std::io;
 
+        #[derive(Debug)]
         pub enum Failure {
             Abort,
             Error(io::Error),
@@ -82,7 +85,7 @@ pub mod rbr {
 
         pub trait RPC<'a, K: 'a, V: 'a> {
             fn read(&'a self, K) -> Result<ReadValue<K, V>, Failure>;
-            // fn write(&self, K, &V) -> Result<(), Failure>;
+            fn write(&'a self, K, &V) -> Result<(), Failure>;
         }
 
         pub trait Node<'a, K: 'a, V: 'a>: RPC<'a, K, V> {
@@ -102,8 +105,7 @@ pub mod rbr {
         impl<'a, 'b, K: Ord + Copy + 'a, V: Clone + 'a> RPC<'a, K, V> for Cluster<'b, K, V> {
 
             fn read(&self, k: K) -> Result<ReadValue<K, V>, Failure> {
-
-                let len: i32 = self.nodes.len() as i32;
+                let len = self.nodes.len() as isize;
                 let mut quorum =  1 + len / 2;
                 let mut errors =  len - quorum + 1;
                 let mut rval : Option<ReadValue<K, V>> = None;
@@ -160,6 +162,38 @@ pub mod rbr {
                 }
                 return Err(error)
             }
+
+            fn write(&self, k: K, v: &V) -> Result<(), Failure> {
+                let len = self.nodes.len() as isize;
+                let mut quorum =  1 + len / 2;
+                let mut errors =  len - quorum + 1;
+                let mut error : Failure = Failure::Abort;
+
+                for node in self.nodes.iter() {
+                    match node.write(k, v) {
+                        Ok(()) => {
+                            quorum -= 1;
+                        },
+                        Err(Failure::Abort) => {
+                            return Err(Failure::Abort);
+                        },
+                        Err(Failure::Error(e)) => {
+                            errors -= 1;
+                            error = Failure::Error(e)
+                        },
+                    }
+
+                    if errors <= 0 || quorum <= 0 {
+                        break
+                    }
+                }
+
+                if quorum <= 0 {
+                    return Ok(())
+                }
+                return Err(error)
+            }
+
         }
     }
 
@@ -208,6 +242,7 @@ mod tests {
 
     struct TestOKNode<'a, K: 'a, V: 'a> {
         id:  u32,
+        // ???(gwik): Arc / Rc is often mentioned with RefCell.. what would be the point ?
         reg: Mutex<&'a RefCell<Register<K, V>>>,
     }
 
@@ -230,48 +265,167 @@ mod tests {
                 None => Err(Failure::Abort),
             }
         }
+
+        fn write(&'a self, k: K, v: &V) -> Result<(), Failure> {
+            match self.reg.lock().unwrap().borrow_mut().write(k, v.clone()) {
+                Some(()) => Ok(()),
+                None => Err(Failure::Abort),
+            }
+        }
     }
+
+    // ???(gwik) how to write a constructor for node
+    // since register would not outlive the scope of the method.
+    // is it even possible ?
+    // e.g:
+    // fn new(id, k) Node<i32,i64> {
+    //     let reg = RefCell::new(Register<...>); // would be destroyed at the end of the scope.
+    // }
 
     #[test]
     fn cluster_read() {
-        let k = 0i32;
 
+        let k = 0i32;
         let regs : Vec<RefCell<Register<i32, i64>>> = vec![
             { let k = k; RefCell::new(Register::empty(k)) },
             { let k = k; RefCell::new(Register::empty(k)) },
+            { let k = k; RefCell::new(Register::empty(k)) },
+            { let k = k; RefCell::new(Register::empty(k)) },
+            { let k = k; RefCell::new(Register::empty(k)) },
         ];
 
-        let nodes : Vec<TestOKNode<i32, i64>> = vec![
-            { TestOKNode::new(0, &regs[0]) },
-            { TestOKNode::new(1, &regs[1]) },
-        ];
+        let nodes : Vec<TestOKNode<i32, i64>> = regs.iter()
+            .enumerate()
+            .map(|(i, r)| TestOKNode::new(i as u32, &r))
+            .collect();
 
-        let nodes : Vec<&Node<i32, i64>> = vec![
-            &nodes[0],
-            &nodes[1],
-        ];
+        let cluster = Cluster::new(nodes
+            .iter()
+            .map(|n| n as &Node<i32, i64>)
+            .collect());
 
-        let cluster = Cluster::new(nodes);
         {
-            let k = 1i32;
-            assert_eq!(cluster.read(k).is_ok(), true);
+            assert!(cluster.read(1i32).is_ok());
         }
         {
-            let k = 1i32;
-            assert_eq!(cluster.read(k).is_err(), true);
+            assert!(cluster.read(1i32).is_err());
         }
         {
-            let k = 2i32;
-            assert_eq!(cluster.read(k).is_ok(), true);
+            assert!(cluster.read(2i32).is_ok());
         }
         {
             let k = 3i32;
             regs[0].borrow_mut().read(k);
 
             let res = cluster.read(k);
-            assert_eq!(res.is_err(), true);
+            assert!(res.is_err());
+            match res.err() {
+                Some(Failure::Abort) => {},
+                Some(Failure::Error(_e)) => assert!(false, "unexpected error"),
+                None => unreachable!(),
+            }
         }
+    }
+
+    #[test]
+    fn cluster_read_write() {
+
+        let k = 0i32;
+        let regs : Vec<RefCell<Register<i32, i64>>> = vec![
+            { let k = k; RefCell::new(Register::empty(k)) },
+            { let k = k; RefCell::new(Register::empty(k)) },
+            { let k = k; RefCell::new(Register::empty(k)) },
+            { let k = k; RefCell::new(Register::empty(k)) },
+            { let k = k; RefCell::new(Register::empty(k)) },
+        ];
+
+        let nodes : Vec<TestOKNode<i32, i64>> = regs.iter()
+            .enumerate()
+            .map(|(i, r)| TestOKNode::new(i as u32, &r))
+            .collect();
+
+        let cluster = Cluster::new(nodes
+            .iter()
+            .map(|n| n as &Node<i32, i64>)
+            .collect());
+
+        assert!(cluster.write(1i32, &1i64).is_ok());
+        assert!(cluster.write(1i32, &2i64).is_ok());
+        assert!(cluster.write(1i32, &1i64).is_ok());
+
+        assert!(cluster.read(1i32).is_err());
+        assert!(cluster.read(2i32).is_ok());
+
+        assert!(cluster.write(1i32, &2i64).is_err());
+        assert!(cluster.write(2i32, &2i64).is_ok());
 
     }
+
+    #[test]
+    fn cluster_partition() {
+
+        let k = 0i32;
+        let regs : Vec<RefCell<Register<i32, i64>>> = vec![
+            { let k = k; RefCell::new(Register::empty(k)) },
+            { let k = k; RefCell::new(Register::empty(k)) },
+            { let k = k; RefCell::new(Register::empty(k)) },
+            { let k = k; RefCell::new(Register::empty(k)) },
+            { let k = k; RefCell::new(Register::empty(k)) },
+        ];
+
+        let nodes : Vec<TestOKNode<i32, i64>> = regs.iter()
+            .enumerate()
+            .map(|(i, r)| TestOKNode::new(i as u32, &r))
+            .collect();
+
+        let cluster = Cluster::new(nodes
+            .iter()
+            .map(|n| n as &Node<i32, i64>)
+            .collect());
+
+        // we partition the cluster in two and check that the read
+        // on the full quorum would return the quorum value.
+
+        {
+            let cluster0 = Cluster::new(nodes[2..4]
+                .iter()
+                .map(|n| n as &Node<i32, i64>)
+                .collect());
+
+            assert!(cluster0.write(4i32, &4i64).is_ok());
+        }
+        {
+            let cluster2 = Cluster::new(nodes[1..2].iter()
+                .chain(nodes[4..5].iter())
+                .map(|n| n as &Node<i32, i64>)
+                .collect());
+
+            assert!(cluster2.write(2i32, &2i64).is_ok());
+        }
+        {
+            let cluster3 = Cluster::new(nodes[1..2].iter()
+                .chain(nodes[4..5].iter())
+                .map(|n| n as &Node<i32, i64>)
+                .collect());
+
+            assert!(cluster3.write(2i32, &2i64).is_ok());
+        }
+
+        let res = cluster.read(6i32);
+        assert!(res.is_ok());
+        let rval = res.unwrap();
+        assert_eq!(rval.val.unwrap(), 4);
+
+
+        // Another surprising result cluster2 should abort because the quorum
+        // is not reached. But we still get the value on the next read.
+
+    }
+
+    // TODO(gwik)
+    //
+    // - lease operation
+    // - write a RPC using channels
+    // - write a RPC with TPC sockets (or UDP if the  protocol allows it) and futures
 
 }
