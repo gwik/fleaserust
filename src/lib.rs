@@ -1,5 +1,3 @@
-extern crate futures;
-
 // BJORN KOLBECK, MIKAEL HOGQVIST, JAN STENDER, FELIX HUPFELD
 // Fault-tolerant and Decentralized Lease Coordination in Distributed Systems
 
@@ -12,7 +10,7 @@ pub mod rbr {
     // Register represents a round-based distributed register a defined in the
     // Paxos paper.
     #[derive(Debug)]
-	pub struct Register<K, V> {
+	pub struct Register<K, V> { // XXX(gwik) is it needed to expose it ?
 		read_at: K,
 		written_at: K,
 		val: Option<V>,
@@ -76,6 +74,9 @@ pub mod rbr {
         use std::vec::{Vec};
         use std::result::{Result};
         use std::io;
+        use std::time::{Duration};
+
+        pub type NodeId = u32;
 
         #[derive(Debug)]
         pub enum Failure {
@@ -84,12 +85,12 @@ pub mod rbr {
         }
 
         pub trait RPC<'a, K: 'a, V: 'a> {
-            fn read(&'a self, K) -> Result<ReadValue<K, V>, Failure>;
-            fn write(&'a self, K, &V) -> Result<(), Failure>;
+            fn read(&'a self, K, timeout: Duration) -> Result<ReadValue<K, V>, Failure>;
+            fn write(&'a self, K, &V, timeout: Duration) -> Result<(), Failure>;
         }
 
         pub trait Node<'a, K: 'a, V: 'a>: RPC<'a, K, V> {
-            fn id(&self) -> u32;
+            fn id(&self) -> NodeId;
         }
  
         pub struct Cluster<'a, K: 'a, V: 'a> {
@@ -110,24 +111,24 @@ pub mod rbr {
             // the register. Register implements a write-once semantic and the
             // value of a successful propose is v or the already set value of
             // the register.
-            pub fn propose(&'a self, k: K, v: V) -> Result<(K, V), Failure> {
-                let (k, v) = match self.read(k) {
+            pub fn propose(&'a self, k: K, v: V, timeout: Duration) -> Result<V, Failure> {
+                let v = match self.read(k, timeout) {
                     Ok(rval) => match rval.val {
-                        Some(existing_value) => (k, existing_value),
-                        None => (k, v),
+                        Some(existing_value) => existing_value,
+                        None => v,
                     },
                     Err(failure) => return Err(failure),
                 };
 
-                match self.write(k, &v) {
+                match self.write(k, &v, timeout) {
                     Ok(()) => {},
                     Err(failure) => return Err(failure),
                 };
 
-                Ok((k, v))
+                Ok(v)
             }
 
-            pub fn read(&self, k: K) -> Result<ReadValue<K, V>, Failure> {
+            pub fn read(&self, k: K, timeout: Duration) -> Result<ReadValue<K, V>, Failure> {
                 let len = self.nodes.len() as isize;
                 let mut quorum =  1 + len / 2;
                 let mut errors =  len - quorum + 1;
@@ -136,7 +137,7 @@ pub mod rbr {
 
                 for node in self.nodes.iter() {
                     let nval : Result<Option<ReadValue<K, V>>, Failure> = {
-                        match node.read(k) {
+                        match node.read(k, timeout) {
                             Ok(node_rval) => {
                                 match rval {
                                     Some(ref rv) => {
@@ -186,14 +187,14 @@ pub mod rbr {
                 return Err(error)
             }
 
-            fn write(&self, k: K, v: &V) -> Result<(), Failure> {
+            pub fn write(&self, k: K, v: &V, timeout: Duration) -> Result<(), Failure> {
                 let len = self.nodes.len() as isize;
                 let mut quorum =  1 + len / 2;
                 let mut errors =  len - quorum + 1;
                 let mut error : Failure = Failure::Abort;
 
                 for node in self.nodes.iter() {
-                    match node.write(k, v) {
+                    match node.write(k, v, timeout) {
                         Ok(()) => {
                             quorum -= 1;
                         },
@@ -218,6 +219,72 @@ pub mod rbr {
             }
         }
     }
+}
+
+pub mod flease {
+    use std::time::{Instant, Duration};
+    use rbr::distributed::{Cluster, NodeId, Failure};
+    use std::thread;
+
+    type K = (Instant, NodeId, i64); // (time, nodeid, random)
+
+    #[derive(Debug, Copy, Clone)]
+    pub struct Lease {
+        pub owner: NodeId,
+        pub expire: Instant,
+    }
+
+    // registers V is an Instant.
+
+    pub struct Leaser<'a> {
+        id: NodeId, // p_i
+        cluster: &'a Cluster<'a, K, Lease>,
+
+        drift_max: Duration, // epsilon
+        lease_max: Duration, // t_max
+    }
+
+    impl<'a> Leaser<'a> {
+
+        pub fn new(id: NodeId, cluster: &'a Cluster<'a, K, Lease>, lease_max: Duration, drift_max: Duration) -> Leaser {
+            return Leaser{id: id, cluster: cluster, lease_max: lease_max, drift_max: drift_max}
+        }
+
+        // TODO(gwik): deadline is probably more appropriate for this recursive function.
+
+        pub fn get_lease(&self, rand: i64, timeout: Duration) -> Result<Lease, Failure> {
+            let k = (Instant::now(), self.id, rand);
+            let lease_opt = match self.cluster.read(k, timeout) {
+                Ok(rval) => rval.val,
+                Err(failure) => return Err(failure),
+            };
+
+            let now = Instant::now();
+            let lease = match lease_opt {
+                Some(lease) => {
+                    if lease.expire < now && lease.expire + self.drift_max > now {
+                        thread::sleep(self.drift_max);
+                        return self.get_lease(rand, timeout)
+                    }
+
+                    if lease.expire < now || lease.owner == self.id {
+                        Lease{expire: now + self.lease_max, owner: self.id}
+                    } else {
+                        lease
+                    }
+                },
+                None => Lease{expire: now + self.lease_max, owner: self.id},
+            };
+
+            match self.cluster.write(k, &lease, timeout) {
+                Ok(()) => Ok(lease),
+                Err(failure) => Err(failure),
+            }
+        }
+
+    }
+
+
 }
 
 #[cfg(test)]
@@ -280,14 +347,14 @@ mod tests {
     }
 
     impl<'a, K: Ord + Copy + 'a, V: Clone + 'a> RPC<'a, K, V> for TestOKNode<'a, K, V> {
-        fn read(&'a self, k: K) -> Result<ReadValue<K, V>, Failure> {
+        fn read(&'a self, k: K, _timeout: Duration) -> Result<ReadValue<K, V>, Failure> {
             match self.reg.lock().unwrap().borrow_mut().read(k) {
                 Some(rval) => Ok(rval),
                 None => Err(Failure::Abort),
             }
         }
 
-        fn write(&'a self, k: K, v: &V) -> Result<(), Failure> {
+        fn write(&'a self, k: K, v: &V, _timeout: Duration) -> Result<(), Failure> {
             match self.reg.lock().unwrap().borrow_mut().write(k, v) {
                 Some(()) => Ok(()),
                 None => Err(Failure::Abort),
@@ -325,20 +392,22 @@ mod tests {
             .map(|n| n as &Node<i32, i64>)
             .collect());
 
+        let timeout = Duration::from_secs(10);
+
         {
-            assert!(cluster.read(1i32).is_ok());
+            assert!(cluster.read(1i32, timeout).is_ok());
         }
         {
-            assert!(cluster.read(1i32).is_err());
+            assert!(cluster.read(1i32, timeout).is_err());
         }
         {
-            assert!(cluster.read(2i32).is_ok());
+            assert!(cluster.read(2i32, timeout).is_ok());
         }
         {
             let k = 3i32;
             regs[0].borrow_mut().read(k);
 
-            let res = cluster.read(k);
+            let res = cluster.read(k, timeout);
             assert!(res.is_err());
             match res.err() {
                 Some(Failure::Abort) => {},
@@ -350,8 +419,8 @@ mod tests {
 
     #[test]
     fn cluster_propose() {
-
         let k = 0i32;
+        let timeout = Duration::from_secs(10);
         let regs : Vec<RefCell<Register<i32, i64>>> = vec![
             { let k = k; RefCell::new(Register::empty(k)) },
             { let k = k; RefCell::new(Register::empty(k)) },
@@ -370,8 +439,21 @@ mod tests {
             .map(|n| n as &Node<i32, i64>)
             .collect());
 
-        assert!(cluster.propose(1, 1i64).is_ok());
-        assert!(cluster.propose(2, 1i64).is_ok());
+        let pres = cluster.propose(1, 1, timeout);
+        assert!(pres.is_ok());
+        assert_eq!(pres.unwrap(), 1);
+
+        let pres = cluster.propose(2, 2, timeout);
+        assert!(pres.is_ok());
+        assert_eq!(pres.unwrap(), 1);
+
+        let pres = cluster.propose(1, 2, timeout);
+        assert!(pres.is_err());
+        match pres.err() {
+            Some(Failure::Abort) => {},
+            _ => unreachable!(),
+        }
+
     }
 
     // TODO(gwik)
