@@ -25,7 +25,7 @@ pub mod rbr {
 		pub val: Option<V>,
 	}
 
-	impl <'a, K: Ord + Copy, V: Clone> Register<K, V> {
+	impl <K: Ord + Copy, V: Clone> Register<K, V> {
 
 		// empty initialize an empty register with k read and write K.
 		pub fn empty(k: K) -> Register<K, V> {
@@ -58,14 +58,14 @@ pub mod rbr {
         // Lemma R3. Read-write-commit: If read(k) or write(k,*) commits, then
         // no subsequent read(k') can commit with k' <= k or write(k'',*) can
         // commit with k'' <= k.
-		pub fn write(&mut self, k: K, v: V) -> Option<()> {
+		pub fn write(&mut self, k: K, v: &V) -> Option<()> {
             // TODO(gwik): consider taking &V and clone on success only.
 
 			if self.written_at > k || self.read_at > k {
 				None
 			} else {
 				self.written_at = k;
-				self.val = Some(v);
+				self.val = Some(v.clone());
 				Some(())
 			}
 		}
@@ -97,14 +97,37 @@ pub mod rbr {
         }
 
         impl<'a, K: Ord + Copy, V: Clone> Cluster<'a, K, V> {
+
             pub fn new(nodes: Vec<&'a Node<'a, K, V>>) -> Cluster<K, V> {
                 Cluster{nodes: nodes}
             }
+
         }
 
-        impl<'a, 'b, K: Ord + Copy + 'a, V: Clone + 'a> RPC<'a, K, V> for Cluster<'b, K, V> {
+        impl<'a, 'b, K: Ord + Copy, V: Clone> Cluster<'b, K, V> {
 
-            fn read(&self, k: K) -> Result<ReadValue<K, V>, Failure> {
+            // propose writes the value v with ballot k and returns the value of
+            // the register. Register implements a write-once semantic and the
+            // value of a successful propose is v or the already set value of
+            // the register.
+            pub fn propose(&'a self, k: K, v: V) -> Result<(K, V), Failure> {
+                let (k, v) = match self.read(k) {
+                    Ok(rval) => match rval.val {
+                        Some(existing_value) => (k, existing_value),
+                        None => (k, v),
+                    },
+                    Err(failure) => return Err(failure),
+                };
+
+                match self.write(k, &v) {
+                    Ok(()) => {},
+                    Err(failure) => return Err(failure),
+                };
+
+                Ok((k, v))
+            }
+
+            pub fn read(&self, k: K) -> Result<ReadValue<K, V>, Failure> {
                 let len = self.nodes.len() as isize;
                 let mut quorum =  1 + len / 2;
                 let mut errors =  len - quorum + 1;
@@ -193,10 +216,8 @@ pub mod rbr {
                 }
                 return Err(error)
             }
-
         }
     }
-
 }
 
 #[cfg(test)]
@@ -219,9 +240,9 @@ mod tests {
         // This can be suprising at first. But this is straightforward once you
         // consider this is a distributed register. If no other process
         // succesfully read the value then the write can happen.
-        assert_eq!(reg.write(now, 1).is_none(), false, "write with the same k must succeed");
-        assert_eq!(reg.write(now, 2).is_none(), false, "write with the same k must succeed");
-        assert_eq!(reg.write(now, 3).is_none(), false, "write with the same k must succeed");
+        assert_eq!(reg.write(now, &1).is_none(), false, "write with the same k must succeed");
+        assert_eq!(reg.write(now, &2).is_none(), false, "write with the same k must succeed");
+        assert_eq!(reg.write(now, &3).is_none(), false, "write with the same k must succeed");
 
         let later = now + Duration::from_millis(1);
         {
@@ -236,8 +257,8 @@ mod tests {
         assert!(reg.read(later).is_none(), "read with same read k must fail");
         assert!(reg.read(now).is_none(), "read with an older k must fail");
 
-        assert_eq!(reg.write(now, 10).is_none(), true, "write with a later k must fail");
-        assert_eq!(reg.write(later, 1).is_none(), false, "write with a later k must fail");
+        assert_eq!(reg.write(now, &10).is_none(), true, "write with a later k must fail");
+        assert_eq!(reg.write(later, &1).is_none(), false, "write with a later k must fail");
     }
 
     struct TestOKNode<'a, K: 'a, V: 'a> {
@@ -267,7 +288,7 @@ mod tests {
         }
 
         fn write(&'a self, k: K, v: &V) -> Result<(), Failure> {
-            match self.reg.lock().unwrap().borrow_mut().write(k, v.clone()) {
+            match self.reg.lock().unwrap().borrow_mut().write(k, v) {
                 Some(()) => Ok(()),
                 None => Err(Failure::Abort),
             }
@@ -328,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_read_write() {
+    fn cluster_propose() {
 
         let k = 0i32;
         let regs : Vec<RefCell<Register<i32, i64>>> = vec![
@@ -349,77 +370,8 @@ mod tests {
             .map(|n| n as &Node<i32, i64>)
             .collect());
 
-        assert!(cluster.write(1i32, &1i64).is_ok());
-        assert!(cluster.write(1i32, &2i64).is_ok());
-        assert!(cluster.write(1i32, &1i64).is_ok());
-
-        assert!(cluster.read(1i32).is_err());
-        assert!(cluster.read(2i32).is_ok());
-
-        assert!(cluster.write(1i32, &2i64).is_err());
-        assert!(cluster.write(2i32, &2i64).is_ok());
-
-    }
-
-    #[test]
-    fn cluster_partition() {
-
-        let k = 0i32;
-        let regs : Vec<RefCell<Register<i32, i64>>> = vec![
-            { let k = k; RefCell::new(Register::empty(k)) },
-            { let k = k; RefCell::new(Register::empty(k)) },
-            { let k = k; RefCell::new(Register::empty(k)) },
-            { let k = k; RefCell::new(Register::empty(k)) },
-            { let k = k; RefCell::new(Register::empty(k)) },
-        ];
-
-        let nodes : Vec<TestOKNode<i32, i64>> = regs.iter()
-            .enumerate()
-            .map(|(i, r)| TestOKNode::new(i as u32, &r))
-            .collect();
-
-        let cluster = Cluster::new(nodes
-            .iter()
-            .map(|n| n as &Node<i32, i64>)
-            .collect());
-
-        // we partition the cluster in two and check that the read
-        // on the full quorum would return the quorum value.
-
-        {
-            let cluster0 = Cluster::new(nodes[2..4]
-                .iter()
-                .map(|n| n as &Node<i32, i64>)
-                .collect());
-
-            assert!(cluster0.write(4i32, &4i64).is_ok());
-        }
-        {
-            let cluster2 = Cluster::new(nodes[1..2].iter()
-                .chain(nodes[4..5].iter())
-                .map(|n| n as &Node<i32, i64>)
-                .collect());
-
-            assert!(cluster2.write(2i32, &2i64).is_ok());
-        }
-        {
-            let cluster3 = Cluster::new(nodes[1..2].iter()
-                .chain(nodes[4..5].iter())
-                .map(|n| n as &Node<i32, i64>)
-                .collect());
-
-            assert!(cluster3.write(2i32, &2i64).is_ok());
-        }
-
-        let res = cluster.read(6i32);
-        assert!(res.is_ok());
-        let rval = res.unwrap();
-        assert_eq!(rval.val.unwrap(), 4);
-
-
-        // Another surprising result cluster2 should abort because the quorum
-        // is not reached. But we still get the value on the next read.
-
+        assert!(cluster.propose(1, 1i64).is_ok());
+        assert!(cluster.propose(2, 1i64).is_ok());
     }
 
     // TODO(gwik)
