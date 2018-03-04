@@ -111,7 +111,7 @@ pub mod rbr {
             // the register. Register implements a write-once semantic and the
             // value of a successful propose is v or the already set value of
             // the register.
-            pub fn propose(&'a self, k: K, v: V, timeout: Duration) -> Result<V, Failure> {
+            pub fn propose(&self, k: K, v: V, timeout: Duration) -> Result<V, Failure> {
                 let v = match self.read(k, timeout) {
                     Ok(rval) => match rval.val {
                         Some(existing_value) => existing_value,
@@ -225,16 +225,53 @@ pub mod flease {
     use std::time::{Instant, Duration};
     use rbr::distributed::{Cluster, NodeId, Failure};
     use std::thread;
+    use std::cmp::Ordering;
 
-    type K = (Instant, NodeId, i64); // (time, nodeid, random)
+    #[derive(Debug, Copy, Clone, Eq)]
+    pub struct K {
+        instant: Instant,
+        node_id: NodeId,
+        rand: i64,
+    }
+
+    impl K {
+        pub fn new(instant: Instant, node_id: NodeId, rand: i64) -> K {
+            K{instant, node_id, rand}
+        }
+
+        pub fn as_tuple(&self) -> (Instant, NodeId, i64) {
+            (self.instant, self.node_id, self.rand)
+        }
+    }
+
+    // TODO(gwik): implement comparator for K : 
+    // "We consider time-ranges for comparison rather than just the timestamps.
+    // As long as |t - t'| <= epsilon, we consider the messages to be equal and
+    // use the process id and a random value to distinguish the messages."
+
+    impl PartialEq for K {
+        fn eq(&self, other: &K) -> bool {
+            self.as_tuple() == other.as_tuple()
+        }
+    }
+
+    impl Ord for K {
+        fn cmp(&self, other: &K) -> Ordering {
+            self.as_tuple().cmp(&other.as_tuple())
+        }
+    }
+
+    impl PartialOrd for K {
+        fn partial_cmp(&self, other: &K) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
 
     #[derive(Debug, Copy, Clone)]
     pub struct Lease {
         pub owner: NodeId,
         pub expire: Instant,
     }
-
-    // registers V is an Instant.
 
     pub struct Leaser<'a> {
         id: NodeId, // p_i
@@ -244,16 +281,16 @@ pub mod flease {
         lease_max: Duration, // t_max
     }
 
-    impl<'a> Leaser<'a> {
+    impl<'a, 'b> Leaser<'a> {
 
-        pub fn new(id: NodeId, cluster: &'a Cluster<'a, K, Lease>, lease_max: Duration, drift_max: Duration) -> Leaser {
+        pub fn new(id: NodeId, cluster: &'b Cluster<'b, K, Lease>, lease_max: Duration, drift_max: Duration) -> Leaser {
             return Leaser{id: id, cluster: cluster, lease_max: lease_max, drift_max: drift_max}
         }
 
-        // TODO(gwik): deadline is probably more appropriate for this recursive function.
+        pub fn get_lease(&'a self, rand: i64, timeout: Duration) -> Result<Lease, Failure> {
+            // TODO(gwik): deadline is probably more appropriate for this recursive function.
 
-        pub fn get_lease(&self, rand: i64, timeout: Duration) -> Result<Lease, Failure> {
-            let k = (Instant::now(), self.id, rand);
+            let k = K{instant: Instant::now(), node_id: self.id, rand: rand};
             let lease_opt = match self.cluster.read(k, timeout) {
                 Ok(rval) => rval.val,
                 Err(failure) => return Err(failure),
@@ -263,6 +300,7 @@ pub mod flease {
             let lease = match lease_opt {
                 Some(lease) => {
                     if lease.expire < now && lease.expire + self.drift_max > now {
+                        // TODO(gwik): do not sleep longer than available time from deadline.
                         thread::sleep(self.drift_max);
                         return self.get_lease(rand, timeout)
                     }
@@ -283,7 +321,120 @@ pub mod flease {
         }
 
     }
+}
 
+// channel_rpc implements rbr::distributed::RPC with channels.
+pub mod channel_rpc {
+
+    use rbr::distributed::{Failure, NodeId, Node, RPC};
+    use rbr::{Register, ReadValue};
+    use std::sync::mpsc::{Sender, Receiver, channel};
+    use std::thread;
+    use std::time::{Duration};
+
+    #[derive(Debug, Clone)]
+    enum Request<K, V> {
+        Read(K),
+        Write((K, V)),
+        Halt,
+    }
+
+    enum Reply<K, V> {
+        Read(Result<ReadValue<K, V>, Failure>),
+        Write(Result<(), Failure>),
+    }
+
+    pub struct ChanNode<K, V> {
+        id: NodeId,
+        thread: Option<thread::JoinHandle<()>>,
+        tx: Sender<(Request<K, V>, Sender<Reply<K, V>>)>,
+    }
+
+    impl<K, V> Clone for ChanNode<K, V> {
+        fn clone(&self) -> ChanNode<K, V> {
+            ChanNode{id: self.id, thread: None, tx: self.tx.clone()}
+        }
+    }
+
+    impl<K: Ord + Copy + Send + 'static, V: Clone + Send + Sync + 'static> ChanNode<K, V> {
+
+        pub fn new(id: NodeId, k0: K) -> ChanNode<K, V> {
+            let (tx, rx): (
+                Sender<(Request<K, V>, Sender<Reply<K, V>>)>,
+                Receiver<(Request<K, V>, Sender<Reply<K, V>>)>,
+            ) = channel();
+
+            let t = thread::spawn(move || {
+                let mut reg = Register::empty(k0);
+                let (req, tx) = match rx.recv() {
+                    Ok(a) => a,
+                    Err(e) => { println!("recv error {:}", e); return },
+                };
+                let reply = match req {
+                    Request::Read(k) => match reg.read(k) {
+                        Some(rval) => Reply::Read(Ok(rval)),
+                        None => Reply::Read(Err(Failure::Abort)),
+                    },
+                    Request::Write((k, v)) => match reg.write(k, &v) {
+                        Some(()) => Reply::Write(Ok(())),
+                        None => Reply::Write(Err(Failure::Abort)),
+                    },
+                    Request::Halt => return,
+                };
+                match tx.send(reply) {
+                    Ok(a) => a,
+                    Err(e) => { println!("send error {:}", e); return },
+                }
+            });
+
+            ChanNode{id: id, tx: tx, thread:Some(t)}
+        }
+
+    }
+
+    impl<K, V> Drop for ChanNode<K, V> {
+        fn drop(&mut self) {
+            let (tx, _) : (Sender<Reply<K, V>>, Receiver<Reply<K, V>>) = channel();
+            match self.tx.send((Request::Halt, tx.clone())) {
+                Ok(_) => {},
+                Err(e) => println!("drop send error node={:} err={:}", self.id, e),
+            }
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    impl<'a, K: Ord + Copy + Send + 'a, V: Clone + Send + 'a> RPC<'a, K, V> for ChanNode<K, V> {
+
+        fn read(&'a self, k: K, _timeout: Duration) -> Result<ReadValue<K, V>, Failure> {
+            let (tx, rx) : (Sender<Reply<K, V>>, Receiver<Reply<K, V>>) = channel();
+            self.tx.send((Request::Read(k), tx.clone())).unwrap();
+            let reply = rx.recv().unwrap();
+            match reply {
+                Reply::Read(res) => res,
+                _ => unreachable!(),
+            }
+        }
+
+        fn write(&'a self, k: K, v: &V, _timeout: Duration) -> Result<(), Failure> {
+            let (tx, rx) : (Sender<Reply<K, V>>, Receiver<Reply<K, V>>) = channel();
+            let v = v.clone();
+            self.tx.send((Request::Write((k, v)), tx.clone())).unwrap(); // TODO(gwik): io::Error on Err
+            let reply = rx.recv().unwrap(); // TODO(gwik): io::Error on Err
+            match reply {
+                Reply::Write(res) => res,
+                _ => unreachable!(),
+            }
+        }
+
+    }
+
+    impl<'a, K: Ord + Copy + Send + 'a, V: Clone + Send + 'a> Node<'a, K, V> for ChanNode<K, V> {
+        fn id(&self) -> NodeId {
+            return self.id
+        }
+    }
 
 }
 
@@ -456,10 +607,60 @@ mod tests {
 
     }
 
+
+    #[test]
+    fn channel_rpc() {
+        use std::time::Duration;
+        use std::thread;
+        use std::time::Instant;
+
+        use rbr::distributed::{Node, Cluster};
+        use channel_rpc::ChanNode;
+        use flease::*;
+
+        let now = Instant::now();
+        let nodes: Vec<ChanNode<K, Lease>> = vec![
+            ChanNode::new(0, K::new(now, 0, 0)),
+            ChanNode::new(1, K::new(now, 0, 0)),
+            ChanNode::new(2, K::new(now, 0, 0)),
+            ChanNode::new(3, K::new(now, 0, 0)),
+            ChanNode::new(4, K::new(now, 0, 0)),
+            ChanNode::new(5, K::new(now, 0, 0)),
+        ];
+
+        let mut threads : Vec<thread::JoinHandle<()>> = vec![];
+        for id in nodes.iter().map(|n| n.id()) {
+            let nodes : Vec<ChanNode<K, Lease>> = nodes.iter().map(|n| (*n).clone()).collect();
+            let handle = thread::spawn(move ||{
+
+                thread::sleep(Duration::from_millis(1));
+
+                let cluster = Cluster::new(nodes
+                    .iter()
+                    .map(|n| n as &Node<K, Lease>)
+                    .collect());
+
+                thread::sleep(Duration::from_millis(1));
+
+                let leaser = Leaser::new(
+                    id, &cluster, Duration::from_secs(10), Duration::from_secs(2));
+
+                thread::sleep(Duration::from_millis(1));
+
+                leaser.get_lease(id as i64, Duration::from_secs(5));
+            });
+            threads.push(handle);
+        }
+
+        for t in threads {
+            t.join().unwrap()
+        }
+
+    }
+
     // TODO(gwik)
     //
-    // - lease operation
-    // - write a RPC using channels
-    // - write a RPC with TPC sockets (or UDP if the  protocol allows it) and futures
+    // - implement a RPC with TPC sockets (or UDP) and futures
+    //   for UDP protocol needs to account for duplicate messages.
 
 }
