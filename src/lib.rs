@@ -74,7 +74,7 @@ pub mod rbr {
         use std::vec::{Vec};
         use std::result::{Result};
         use std::io;
-        use std::time::{Duration};
+        use std::time::{Instant};
 
         pub type NodeId = u32;
 
@@ -85,8 +85,8 @@ pub mod rbr {
         }
 
         pub trait RPC<'a, K: 'a, V: 'a> {
-            fn read(&'a self, K, timeout: Duration) -> Result<ReadValue<K, V>, Failure>;
-            fn write(&'a self, K, &V, timeout: Duration) -> Result<(), Failure>;
+            fn read(&'a self, K, deadline: Instant) -> Result<ReadValue<K, V>, Failure>;
+            fn write(&'a self, K, &V, deadline: Instant) -> Result<(), Failure>;
         }
 
         pub trait Node<'a, K: 'a, V: 'a>: RPC<'a, K, V> {
@@ -111,8 +111,8 @@ pub mod rbr {
             // the register. Register implements a write-once semantic and the
             // value of a successful propose is v or the already set value of
             // the register.
-            pub fn propose(&self, k: K, v: V, timeout: Duration) -> Result<V, Failure> {
-                let v = match self.read(k, timeout) {
+            pub fn propose(&self, k: K, v: V, deadline: Instant) -> Result<V, Failure> {
+                let v = match self.read(k, deadline) {
                     Ok(rval) => match rval.val {
                         Some(existing_value) => existing_value,
                         None => v,
@@ -120,7 +120,7 @@ pub mod rbr {
                     Err(failure) => return Err(failure),
                 };
 
-                match self.write(k, &v, timeout) {
+                match self.write(k, &v, deadline) {
                     Ok(()) => {},
                     Err(failure) => return Err(failure),
                 };
@@ -128,7 +128,7 @@ pub mod rbr {
                 Ok(v)
             }
 
-            pub fn read(&self, k: K, timeout: Duration) -> Result<ReadValue<K, V>, Failure> {
+            pub fn read(&self, k: K, deadline: Instant) -> Result<ReadValue<K, V>, Failure> {
                 let len = self.nodes.len() as isize;
                 let mut quorum =  1 + len / 2;
                 let mut errors =  len - quorum + 1;
@@ -137,7 +137,7 @@ pub mod rbr {
 
                 for node in self.nodes.iter() {
                     let nval : Result<Option<ReadValue<K, V>>, Failure> = {
-                        match node.read(k, timeout) {
+                        match node.read(k, deadline) {
                             Ok(node_rval) => {
                                 match rval {
                                     Some(ref rv) => {
@@ -187,14 +187,14 @@ pub mod rbr {
                 return Err(error)
             }
 
-            pub fn write(&self, k: K, v: &V, timeout: Duration) -> Result<(), Failure> {
+            pub fn write(&self, k: K, v: &V, deadline: Instant) -> Result<(), Failure> {
                 let len = self.nodes.len() as isize;
                 let mut quorum =  1 + len / 2;
                 let mut errors =  len - quorum + 1;
                 let mut error : Failure = Failure::Abort;
 
                 for node in self.nodes.iter() {
-                    match node.write(k, v, timeout) {
+                    match node.write(k, v, deadline) {
                         Ok(()) => {
                             quorum -= 1;
                         },
@@ -269,8 +269,18 @@ pub mod flease {
 
     #[derive(Debug, Copy, Clone)]
     pub struct Lease {
-        pub owner: NodeId,
-        pub expire: Instant,
+        owner: NodeId,
+        expire: Instant,
+    }
+
+    impl Lease {
+        pub fn owner(&self) -> NodeId {
+            self.owner
+        }
+
+        pub fn expire(&self) -> Instant {
+            self.expire
+        }
     }
 
     pub struct Leaser<'a> {
@@ -281,20 +291,22 @@ pub mod flease {
         lease_max: Duration, // t_max
     }
 
-    impl<'a, 'b> Leaser<'a> {
+    impl<'a> Leaser<'a> {
 
-        pub fn new(id: NodeId, cluster: &'b Cluster<'b, K, Lease>, lease_max: Duration, drift_max: Duration) -> Leaser {
+        pub fn new(id: NodeId, cluster: &'a Cluster<'a, K, Lease>, lease_max: Duration, drift_max: Duration) -> Leaser {
             return Leaser{id: id, cluster: cluster, lease_max: lease_max, drift_max: drift_max}
         }
 
-        pub fn get_lease(&'a self, rand: i64, timeout: Duration) -> Result<Lease, Failure> {
+        pub fn get_lease(&self, rand: i64, deadline: Instant) -> Result<Lease, Failure> {
             // TODO(gwik): deadline is probably more appropriate for this recursive function.
 
             let k = K{instant: Instant::now(), node_id: self.id, rand: rand};
-            let lease_opt = match self.cluster.read(k, timeout) {
+            let lease_opt = match self.cluster.read(k, deadline) {
                 Ok(rval) => rval.val,
                 Err(failure) => return Err(failure),
             };
+
+            // println!("debug: get_lease after read {:?}", k.as_tuple());
 
             let now = Instant::now();
             let lease = match lease_opt {
@@ -302,7 +314,7 @@ pub mod flease {
                     if lease.expire < now && lease.expire + self.drift_max > now {
                         // TODO(gwik): do not sleep longer than available time from deadline.
                         thread::sleep(self.drift_max);
-                        return self.get_lease(rand, timeout)
+                        return self.get_lease(rand, deadline)
                     }
 
                     if lease.expire < now || lease.owner == self.id {
@@ -314,7 +326,7 @@ pub mod flease {
                 None => Lease{expire: now + self.lease_max, owner: self.id},
             };
 
-            match self.cluster.write(k, &lease, timeout) {
+            match self.cluster.write(k, &lease, deadline) {
                 Ok(()) => Ok(lease),
                 Err(failure) => Err(failure),
             }
@@ -330,7 +342,8 @@ pub mod channel_rpc {
     use rbr::{Register, ReadValue};
     use std::sync::mpsc::{Sender, Receiver, channel};
     use std::thread;
-    use std::time::{Duration};
+    use std::time::{Instant};
+    use std::io;
 
     #[derive(Debug, Clone)]
     enum Request<K, V> {
@@ -366,65 +379,143 @@ pub mod channel_rpc {
 
             let t = thread::spawn(move || {
                 let mut reg = Register::empty(k0);
-                let (req, tx) = match rx.recv() {
-                    Ok(a) => a,
-                    Err(e) => { println!("recv error {:}", e); return },
-                };
-                let reply = match req {
-                    Request::Read(k) => match reg.read(k) {
-                        Some(rval) => Reply::Read(Ok(rval)),
-                        None => Reply::Read(Err(Failure::Abort)),
-                    },
-                    Request::Write((k, v)) => match reg.write(k, &v) {
-                        Some(()) => Reply::Write(Ok(())),
-                        None => Reply::Write(Err(Failure::Abort)),
-                    },
-                    Request::Halt => return,
-                };
-                match tx.send(reply) {
-                    Ok(a) => a,
-                    Err(e) => { println!("send error {:}", e); return },
+                loop {
+                    let (req, tx) = match rx.recv() {
+                        Ok(a) => a,
+                        Err(e) => { println!("channode: recv error {:}", e); return },
+                    };
+                    let reply = match req {
+                        Request::Read(k) => match reg.read(k) {
+                            Some(rval) => Reply::Read(Ok(rval)),
+                            None => Reply::Read(Err(Failure::Abort)),
+                        },
+                        Request::Write((k, v)) => match reg.write(k, &v) {
+                            Some(()) => Reply::Write(Ok(())),
+                            None => Reply::Write(Err(Failure::Abort)),
+                        },
+                        Request::Halt => return,
+                    };
+                    match tx.send(reply) {
+                        Ok(a) => a,
+                        Err(e) => { println!("channode: send error {:}", e); return },
+                    }
                 }
             });
 
             ChanNode{id: id, tx: tx, thread:Some(t)}
         }
 
-    }
-
-    impl<K, V> Drop for ChanNode<K, V> {
-        fn drop(&mut self) {
+        pub fn halt(&self) {
             let (tx, _) : (Sender<Reply<K, V>>, Receiver<Reply<K, V>>) = channel();
             match self.tx.send((Request::Halt, tx.clone())) {
                 Ok(_) => {},
                 Err(e) => println!("drop send error node={:} err={:}", self.id, e),
             }
-            if let Some(thread) = self.thread.take() {
-                thread.join().unwrap();
-            }
         }
     }
 
+    // impl<K, V> Drop for ChanNode<K, V> {
+    //     fn drop(&mut self) {
+    //         let (tx, _) : (Sender<Reply<K, V>>, Receiver<Reply<K, V>>) = channel();
+    //         match self.tx.send((Request::Halt, tx.clone())) {
+    //             Ok(_) => {},
+    //             Err(e) => println!("drop send error node={:} err={:}", self.id, e),
+    //         }
+    //         if let Some(thread) = self.thread.take() {
+    //             thread.join().unwrap();
+    //         }
+    //      }
+    //  }
+
     impl<'a, K: Ord + Copy + Send + 'a, V: Clone + Send + 'a> RPC<'a, K, V> for ChanNode<K, V> {
 
-        fn read(&'a self, k: K, _timeout: Duration) -> Result<ReadValue<K, V>, Failure> {
+        fn read(&'a self, k: K, deadline: Instant) -> Result<ReadValue<K, V>, Failure> {
             let (tx, rx) : (Sender<Reply<K, V>>, Receiver<Reply<K, V>>) = channel();
-            self.tx.send((Request::Read(k), tx.clone())).unwrap();
-            let reply = rx.recv().unwrap();
-            match reply {
-                Reply::Read(res) => res,
-                _ => unreachable!(),
+            match self.tx.send((Request::Read(k), tx.clone())) {
+                Ok(_) => {},
+                Err(_) => return Err(
+                    Failure::Error(
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "read: send error"
+                        )
+                    )
+                ),
+            }
+
+            let now = Instant::now();
+            if deadline <= now {
+                return Err(
+                    Failure::Error(
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "read: deadline exceeded",
+                        )
+                    )
+                )
+            }
+
+            match rx.recv_timeout(deadline - now) {
+                Ok(reply) => {
+                    match reply {
+                        Reply::Read(res) => res,
+                        _ => unreachable!(),
+                    }
+                },
+                Err(_) => return Err(
+                    Failure::Error(
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "read: recv timeout",
+                        )
+                    )
+                ),
             }
         }
 
-        fn write(&'a self, k: K, v: &V, _timeout: Duration) -> Result<(), Failure> {
+        fn write(&'a self, k: K, v: &V, deadline: Instant) -> Result<(), Failure> {
             let (tx, rx) : (Sender<Reply<K, V>>, Receiver<Reply<K, V>>) = channel();
             let v = v.clone();
-            self.tx.send((Request::Write((k, v)), tx.clone())).unwrap(); // TODO(gwik): io::Error on Err
-            let reply = rx.recv().unwrap(); // TODO(gwik): io::Error on Err
-            match reply {
-                Reply::Write(res) => res,
-                _ => unreachable!(),
+            match self.tx.send((Request::Write((k, v)), tx.clone())) {
+                Ok(_) => {},
+                Err(_) => return Err(
+                    Failure::Error(
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "write: send error"
+                        )
+                    )
+                ),
+            }
+
+            let now = Instant::now();
+            if deadline <= now {
+                return Err(
+                    Failure::Error(
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "write: deadline exceeded",
+                        )
+                    )
+                )
+            }
+
+            // XXX(gwik) recv_deadline is in nightly
+            match rx.recv_timeout(deadline - Instant::now()) {
+                Ok(reply) => {
+                    match reply {
+                        Reply::Write(res) => res,
+                        _ => unreachable!(),
+                    }
+                },
+                Err(_) => return Err(
+                    Failure::Error(
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "write: recv timeout",
+                        )
+                    )
+                ),
             }
         }
 
@@ -438,8 +529,15 @@ pub mod channel_rpc {
 
 }
 
+
+#[cfg(test)]
+extern crate timebomb;
+#[cfg(test)]
+extern crate rand;
+
 #[cfg(test)]
 mod tests {
+
     use std::time::{Instant, Duration};
     use std::result::{Result};
     use std::cell::{RefCell};
@@ -498,14 +596,14 @@ mod tests {
     }
 
     impl<'a, K: Ord + Copy + 'a, V: Clone + 'a> RPC<'a, K, V> for TestOKNode<'a, K, V> {
-        fn read(&'a self, k: K, _timeout: Duration) -> Result<ReadValue<K, V>, Failure> {
+        fn read(&'a self, k: K, _deadline: Instant) -> Result<ReadValue<K, V>, Failure> {
             match self.reg.lock().unwrap().borrow_mut().read(k) {
                 Some(rval) => Ok(rval),
                 None => Err(Failure::Abort),
             }
         }
 
-        fn write(&'a self, k: K, v: &V, _timeout: Duration) -> Result<(), Failure> {
+        fn write(&'a self, k: K, v: &V, _deadline: Instant) -> Result<(), Failure> {
             match self.reg.lock().unwrap().borrow_mut().write(k, v) {
                 Some(()) => Ok(()),
                 None => Err(Failure::Abort),
@@ -543,22 +641,22 @@ mod tests {
             .map(|n| n as &Node<i32, i64>)
             .collect());
 
-        let timeout = Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
 
         {
-            assert!(cluster.read(1i32, timeout).is_ok());
+            assert!(cluster.read(1i32, deadline).is_ok());
         }
         {
-            assert!(cluster.read(1i32, timeout).is_err());
+            assert!(cluster.read(1i32, deadline).is_err());
         }
         {
-            assert!(cluster.read(2i32, timeout).is_ok());
+            assert!(cluster.read(2i32, deadline).is_ok());
         }
         {
             let k = 3i32;
             regs[0].borrow_mut().read(k);
 
-            let res = cluster.read(k, timeout);
+            let res = cluster.read(k, deadline);
             assert!(res.is_err());
             match res.err() {
                 Some(Failure::Abort) => {},
@@ -571,7 +669,7 @@ mod tests {
     #[test]
     fn cluster_propose() {
         let k = 0i32;
-        let timeout = Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let regs : Vec<RefCell<Register<i32, i64>>> = vec![
             { let k = k; RefCell::new(Register::empty(k)) },
             { let k = k; RefCell::new(Register::empty(k)) },
@@ -590,15 +688,15 @@ mod tests {
             .map(|n| n as &Node<i32, i64>)
             .collect());
 
-        let pres = cluster.propose(1, 1, timeout);
+        let pres = cluster.propose(1, 1, deadline);
         assert!(pres.is_ok());
         assert_eq!(pres.unwrap(), 1);
 
-        let pres = cluster.propose(2, 2, timeout);
+        let pres = cluster.propose(2, 2, deadline);
         assert!(pres.is_ok());
         assert_eq!(pres.unwrap(), 1);
 
-        let pres = cluster.propose(1, 2, timeout);
+        let pres = cluster.propose(1, 2, deadline);
         assert!(pres.is_err());
         match pres.err() {
             Some(Failure::Abort) => {},
@@ -607,9 +705,13 @@ mod tests {
 
     }
 
-
     #[test]
     fn channel_rpc() {
+        use rand;
+        use rand::distributions::{IndependentSample, Range};
+
+        use timebomb::timeout_ms;
+
         use std::time::Duration;
         use std::thread;
         use std::time::Instant;
@@ -618,48 +720,66 @@ mod tests {
         use channel_rpc::ChanNode;
         use flease::*;
 
-        let now = Instant::now();
-        let nodes: Vec<ChanNode<K, Lease>> = vec![
-            ChanNode::new(0, K::new(now, 0, 0)),
-            ChanNode::new(1, K::new(now, 0, 0)),
-            ChanNode::new(2, K::new(now, 0, 0)),
-            ChanNode::new(3, K::new(now, 0, 0)),
-            ChanNode::new(4, K::new(now, 0, 0)),
-            ChanNode::new(5, K::new(now, 0, 0)),
-        ];
+        timeout_ms(|| {
 
-        let mut threads : Vec<thread::JoinHandle<()>> = vec![];
-        for id in nodes.iter().map(|n| n.id()) {
-            let nodes : Vec<ChanNode<K, Lease>> = nodes.iter().map(|n| (*n).clone()).collect();
-            let handle = thread::spawn(move ||{
+            let now = Instant::now();
+            let nodes: Vec<ChanNode<K, Lease>> = vec![
+                ChanNode::new(0, K::new(now, 0, 0)),
+                ChanNode::new(1, K::new(now, 0, 0)),
+                ChanNode::new(2, K::new(now, 0, 0)),
+                ChanNode::new(3, K::new(now, 0, 0)),
+                ChanNode::new(4, K::new(now, 0, 0)),
+                ChanNode::new(5, K::new(now, 0, 0)),
+            ];
 
-                thread::sleep(Duration::from_millis(1));
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut threads : Vec<thread::JoinHandle<()>> = vec![];
+            for id in nodes.iter().map(|n| n.id()) {
+                let nodes : Vec<ChanNode<K, Lease>> = nodes.iter().map(|n| (*n).clone()).collect();
+                let handle = thread::spawn(move ||{
 
-                let cluster = Cluster::new(nodes
-                    .iter()
-                    .map(|n| n as &Node<K, Lease>)
-                    .collect());
+                    let mut rng = rand::thread_rng();
 
-                thread::sleep(Duration::from_millis(1));
+                    let cluster = Cluster::new(nodes
+                        .iter()
+                        .map(|n| n as &Node<K, Lease>)
+                        .collect());
 
-                let leaser = Leaser::new(
-                    id, &cluster, Duration::from_secs(10), Duration::from_secs(2));
+                    let leaser = Leaser::new(
+                        id, &cluster, Duration::from_secs(5), Duration::from_secs(2));
 
-                thread::sleep(Duration::from_millis(1));
+                    let range = Range::new(1, 6);
+                    for _ in 0..10 {
+                        match leaser.get_lease(id as i64, deadline) {
+                            Ok(lease) => {
+                                println!("node={:} at {:?} got lease {:?}", id, Instant::now(), lease);
+                            },
+                            Err(e) => {
+                                println!("node={:} at {:?} got err {:?}", id, Instant::now(), e);
+                            },
+                        }
 
-                leaser.get_lease(id as i64, Duration::from_secs(5));
-            });
-            threads.push(handle);
-        }
+                        thread::sleep(Duration::from_secs(range.ind_sample(&mut rng)));
+                    }
+                });
+                threads.push(handle);
+            }
 
-        for t in threads {
-            t.join().unwrap()
-        }
+            for t in threads {
+                t.join().unwrap()
+            }
+
+            for n in nodes {
+                n.halt()
+            }
+
+        }, 60000);
 
     }
 
     // TODO(gwik)
     //
+    // - Abort should include K
     // - implement a RPC with TPC sockets (or UDP) and futures
     //   for UDP protocol needs to account for duplicate messages.
 

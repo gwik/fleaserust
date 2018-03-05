@@ -3,7 +3,6 @@ name = "flease"
 version = "0.1.0"
 authors = ["Antonin Amand <antonin.amand@gmail.com>"]
 
-[dependencies]
-futures = "0.1"
-tokio = "0.1"
-tokio-io = "0.1"
+[dev-dependencies]
+timebomb = "0.1.2"
+rand="0.4.2"
